@@ -1,2208 +1,751 @@
-Below is the **complete finalized summary** of your design from start till this point.
+To cover **similar cases properly**, I need data that lets us create **case summaries**, not raw sensor rows only.
 
-Your fixed architecture remains unchanged. What we finalized is the **DB layer, embedding layer, document organization, collection strategy, ingestion flow, retrieval flow, and how it connects to the recommendation pipeline**.
+Think of `similar_case_rag` like this:
+
+```text
+Current inference case
+        ↓
+Find previous cases with similar:
+risk zone + TTE + uncertainty + confidence + alarms + subset + outcome
+        ↓
+Use those cases to justify recommendation
+```
+
+So I need files that contain **prediction outputs, uncertainty, actual TTE if available, risk zones, errors, and case identity**.
 
 ***
 
-# 1. Final Stack Decision
+# 1. Minimum Data I Need
 
-## Final DB
-
-```text
-Qdrant
-```
-
-Use **one Qdrant deployment/service**, not multiple DB servers.
-
-Inside that one Qdrant instance, create **five separate collections**:
+If you want to start with the best useful similar cases, give me these files first:
 
 ```text
-domain_rag
-similar_case_rag
-metric_rag
-policy_rag
-failure_mode_rag
+recommendation_ready_predictions.csv
+llm_recommendation_input.json
+critical_case_details_*.csv
+top_error_cases_*.csv
+top_uncertain_cases_width95_*.csv
+coverage_details_*.csv
+not_covered_95_cases_*.csv
+test_uq_predictions_*.csv
 ```
 
-This is the best design for your system because each RAG branch has a different purpose, different metadata, different retrieval behavior, and different evidence-quality requirement. Qdrant supports vector storage with payload metadata and filtering, which fits this branch-wise RAG design. [\[analyticsvidhya.com\]](https://www.analyticsvidhya.com/blog/2025/09/embeddinggemma/)
+If you do not have all of them, no issue. Start with whatever exists.
+
+The most important one is:
+
+```text
+test_uq_predictions_weighted_stacking_boosting_cnn.csv
+```
+
+or your final inference prediction CSV.
 
 ***
 
-## Final Embedder
+# 2. Exact Columns I Need Per Case
 
-```text
-BAAI/bge-m3
-```
-
-Why BGE-M3:
-
-```text
-Dense retrieval       → semantic search
-Sparse retrieval      → keyword / word-based search
-Multi-vector retrieval → fine-grained matching
-```
-
-This is ideal for your use case because your input has both semantic summaries and exact technical terms like `TTE`, `PICP`, `MPIW`, `CRPS`, `SHAP`, `anomaly_score`, and `vibration_rms`. BGE-M3 is documented as supporting dense, sparse, and multi-vector retrieval, and it supports more than 100 languages with input length up to 8192 tokens. [\[betterstack.com\]](https://betterstack.com/community/guides/ai/gemma-4/), [\[brian.kitchen\]](https://www.brian.kitchen/blog/introduction-to-rag)
-
-Key BGE-M3 specs:
-
-```text
-Model: BAAI/bge-m3
-License: MIT
-Embedding dimension: 1024
-Max sequence length: 8192 tokens
-Model size: ~569M parameters
-Retrieval modes: dense + sparse + multi-vector
-```
-
-The model card lists BGE-M3 with 1024 dimensions, 8192 sequence length, and MIT licensing. [\[ollama.com\]](https://ollama.com/library/embeddinggemma), [\[prabs.xyz\]](https://prabs.xyz/blog/per-layer-embeddings-the-secret-powering-gemma-4-models)
+For each similar case, I need these categories.
 
 ***
 
-## Final Retrieval Type
+## A. Case Identity Fields
+
+These tell us **which engine and which point in time** the case belongs to.
+
+Required if available:
 
 ```text
-Hybrid retrieval = dense semantic retrieval + sparse keyword retrieval
+unit
+sample_index
+sample_role
+subset
+end_cycle
+window_start_cycle
+hidden_failure_cycle_est
+source_file
+source_row_id
 ```
 
-Dense retrieval helps with meaning-based queries.
+### Why needed?
 
-Sparse retrieval helps with exact terms and metric names.
+Because a case should not be anonymous.
 
-Qdrant supports hybrid search by combining dense and sparse vectors, with fusion methods like RRF and DBSF. [\[railway.com\]](https://railway.com/deploy/embedding-gemma), [\[huggingface.co\]](https://huggingface.co/Ccre/gemma-embedding-model)
-
-***
-
-## Final Reranker
-
-Use one of these:
-
-```text
-Primary: BAAI/bge-reranker-v2-m3
-Alternative: Qwen3-Reranker-0.6B
-```
-
-Your architecture already has:
-
-```text
-Context Merger + Reranker
-```
-
-So the retriever should fetch more candidates first, then the reranker selects the best evidence chunks. The BGE-M3 documentation also recommends hybrid retrieval followed by reranking for stronger RAG quality. [\[brian.kitchen\]](https://www.brian.kitchen/blog/introduction-to-rag), [\[prabs.xyz\]](https://prabs.xyz/blog/per-layer-embeddings-the-secret-powering-gemma-4-models)
-
-***
-
-# 2. Final Architecture View
-
-Your original flow becomes this implementation-level flow:
-
-```text
-User / System Request
-        |
-        v
-ML/DL TTE Prediction Output
-        |
-        v
-Structured Prediction & Explanation Layer
-        |
-        |-- predicted TTE
-        |-- confidence / certainty
-        |-- uncertainty interval
-        |-- risk score / risk level
-        |-- built-in metrics
-        |-- custom metrics
-        |-- top features / SHAP / feature importance
-        |-- anomaly score
-        |-- chart summaries
-        |-- data quality score
-        |
-        v
-Structured JSON Input
-        |
-        v
-Query Router / Planner
-        |
-        |-----------------------------------------------------------------
-        |                |              |              |                  |
-        v                v              v              v                  v
-   Domain RAG      Similar Case RAG   Metric RAG   Policy RAG     Failure Mode RAG
-        |                |              |              |                  |
-        v                v              v              v                  v
-   Qdrant          Qdrant         Qdrant         Qdrant           Qdrant
-   domain_rag      similar_case   metric_rag     policy_rag       failure_mode_rag
-        |                |              |              |                  |
-        |-----------------------------------------------------------------
-        |
-        v
-Context Merger + Reranker
-        |
-        v
-Evidence Pack
-        |
-        v
-Evidence Quality Checker
-        |
-        |-----------------------------|
-        |                             |
-        v                             v
- Evidence Sufficient           Evidence Weak / Missing / Conflicting
-        |                             |
-        |                             v
-        |                  Optional Controlled Web / External RAG
-        |                             |
-        |                             v
-        |                  External Evidence Validator
-        |                             |
-        |-----------------------------|
-        |
-        v
-Updated Evidence Pack
-        |
-        v
-Candidate Action Generator
-        |
-        v
-Safety / Policy Constraint Layer
-        |
-        v
-Multi-Objective Scoring Layer
-        |
-        |-- Balanced
-        |-- Cost-Optimized
-        |-- Safety-First
-        |-- Downtime-Minimized
-        |-- Risk-Minimized
-        |-- Conservative
-        |-- Optional: Performance-Optimized
-        |
-        v
-Recommendation Option Builder
-        |
-        v
-LLM Explanation Layer
-        |
-        v
-Output Validator
-        |
-        v
-Final Recommendation JSON with Sources, Trade-offs, Confidence, and Options
-        |
-        v
-Feedback / Logging / Monitoring JSON
-```
-
-***
-
-# 3. DB Design: One Qdrant Instance, Five Collections
-
-Do **not** create five different databases.
-
-Create:
-
-```text
-One Qdrant instance
-```
-
-With:
-
-```text
-domain_rag
-similar_case_rag
-metric_rag
-policy_rag
-failure_mode_rag
-```
-
-This gives you:
-
-```text
-better retrieval separation
-cleaner storage
-branch-wise tuning
-easier debugging
-better evidence-quality checking
-easier future updates
-```
-
-Qdrant supports collections, metadata payloads, dense vectors, sparse vectors, and hybrid retrieval patterns, making this structure suitable for your system. [\[railway.com\]](https://railway.com/deploy/embedding-gemma), [\[analyticsvidhya.com\]](https://www.analyticsvidhya.com/blog/2025/09/embeddinggemma/)
-
-***
-
-# 4. Why Five Collections Instead of One?
-
-You could start with one collection for MVP, but for your fixed architecture, five collections are better.
-
-## Reason 1: Cleaner retrieval
-
-Each branch has a different purpose:
-
-```text
-domain_rag        → general predictive-maintenance knowledge
-similar_case_rag  → previous recommendation cases
-metric_rag        → metric and UQ interpretation
-policy_rag        → rules and constraints
-failure_mode_rag  → fault/failure knowledge
-```
-
-Keeping them separate avoids retrieval pollution.
-
-***
-
-## Reason 2: Different retrieval behavior
-
-Recommended retrieval style:
-
-```text
-domain_rag        → dense-heavy hybrid search
-similar_case_rag  → dense + metadata filtering
-metric_rag        → sparse-heavy hybrid search
-policy_rag        → strict metadata + sparse-heavy search
-failure_mode_rag  → balanced dense + sparse search
-```
-
-This is important because `metric_rag` and `policy_rag` need exact matching more than `domain_rag`.
-
-***
-
-## Reason 3: Better evidence quality checking
-
-Your Evidence Quality Checker can verify coverage branch-wise:
-
-```text
-Did Domain RAG return useful evidence?
-Did Similar Case RAG return a relevant case?
-Did Metric RAG explain the important metrics?
-Did Policy RAG return valid constraints?
-Did Failure Mode RAG identify likely failure modes?
-```
-
-This becomes easier when each branch has its own collection.
-
-***
-
-# 5. Final Folder-Based Knowledge Base Design
-
-Yes, your folder idea is correct and recommended.
-
-Use this structure:
-
-```text
-rag_knowledge_base/
-│
-├── domain_rag/
-│   ├── docs/
-│   └── metadata.json
-│
-├── similar_case_rag/
-│   ├── docs/
-│   └── metadata.json
-│
-├── metric_rag/
-│   ├── docs/
-│   └── metadata.json
-│
-├── policy_rag/
-│   ├── docs/
-│   └── metadata.json
-│
-└── failure_mode_rag/
-    ├── docs/
-    └── metadata.json
-```
-
-Folder name maps directly to Qdrant collection name:
-
-```text
-rag_knowledge_base/domain_rag/         → Qdrant collection: domain_rag
-rag_knowledge_base/similar_case_rag/   → Qdrant collection: similar_case_rag
-rag_knowledge_base/metric_rag/         → Qdrant collection: metric_rag
-rag_knowledge_base/policy_rag/         → Qdrant collection: policy_rag
-rag_knowledge_base/failure_mode_rag/   → Qdrant collection: failure_mode_rag
-```
-
-This is simple, reliable, and avoids incorrect automatic classification.
-
-***
-
-# 6. What the Embedder Does and Does Not Do
-
-Important point:
-
-```text
-BGE-M3 does not decide which collection the document goes into.
-```
-
-The collection is decided by:
-
-```text
-folder name
-```
-
-Then the embedder only does:
-
-```text
-text chunk → dense vector + sparse vector
-```
-
-Then your ingestion pipeline inserts that chunk into the matching Qdrant collection.
-
-So the flow is:
-
-```text
-Document placed in folder
-        |
-        v
-Folder name decides collection
-        |
-        v
-Text is extracted and chunked
-        |
-        v
-BGE-M3 creates dense + sparse embeddings
-        |
-        v
-Chunk is inserted into matching Qdrant collection
-```
-
-***
-
-# 7. What Documents Go Into Each Folder?
-
-## `domain_rag`
-
-Put:
-
-```text
-predictive maintenance principles
-asset degradation knowledge
-engineering interpretation rules
-maintenance best practices
-equipment behavior documents
-```
-
-Example files:
-
-```text
-pump_degradation.md
-vibration_temperature_interpretation.md
-maintenance_best_practices.md
-```
-
-***
-
-## `similar_case_rag`
-
-Put:
-
-```text
-previous recommendation cases
-previous structured input/output summaries
-accepted recommendations
-actual outcomes if available
-technician feedback summaries
-```
-
-Example files:
-
-```text
-case_001.json
-case_002.json
-case_003.md
-```
-
-This collection will grow over time from your Feedback / Logging / Monitoring layer.
-
-***
-
-## `metric_rag`
-
-Put:
-
-```text
-TTE definitions
-confidence interpretation
-uncertainty interval interpretation
-PICP
-MPIW
-CRPS
-MAE
-RMSE
-R2
-SHAP
-feature importance
-anomaly score
-data quality score
-custom metric definitions
-chart-summary interpretation rules
-```
-
-Example files:
-
-```text
-tte_definition.md
-uncertainty_interval.md
-picp.md
-mpiw.md
-shap.md
-anomaly_score.md
-data_quality_score.md
-```
-
-***
-
-## `policy_rag`
-
-Put:
-
-```text
-inspection rules
-shutdown rules
-escalation rules
-maintenance decision policies
-risk-level rules
-TTE threshold rules
-safety constraints
-approval requirements
-```
-
-Example files:
-
-```text
-high_risk_policy.md
-critical_tte_policy.md
-inspection_escalation_policy.md
-downtime_policy.md
-```
-
-This should be highly curated. Do not fill this from random web data.
-
-***
-
-## `failure_mode_rag`
-
-Put:
-
-```text
-bearing wear
-misalignment
-lubrication failure
-overheating
-cavitation
-seal leakage
-fatigue
-electrical degradation
-symptom-to-failure mappings
-recommended checks
-```
-
-Example files:
-
-```text
-bearing_wear.md
-misalignment.md
-cavitation.md
-lubrication_failure.md
-overheating.md
-```
-
-***
-
-# 8. Ingestion Pipeline
-
-Your ingestion pipeline should work like this:
-
-```text
-1. Create Qdrant collections
-2. Create matching folders
-3. Place trusted documents manually in the correct folders
-4. Read each folder
-5. Extract text from documents
-6. Clean text
-7. Chunk text
-8. Generate BGE-M3 dense + sparse embeddings
-9. Insert chunks into corresponding Qdrant collection
-10. Store metadata with every chunk
-```
-
-Detailed flow:
-
-```text
-rag_knowledge_base/domain_rag/docs/file.md
-        |
-        v
-collection_name = "domain_rag"
-        |
-        v
-extract text
-        |
-        v
-chunk text
-        |
-        v
-BGE-M3 embedding
-        |
-        |-- dense vector
-        |-- sparse vector
-        |
-        v
-insert into Qdrant collection: domain_rag
-```
-
-***
-
-# 9. Recommended Metadata
-
-Even though folder name decides collection, still store metadata with every chunk.
-
-Every chunk should include:
+Bad case:
 
 ```json
 {
-  "rag_type": "metric",
-  "collection_name": "metric_rag",
-  "source_id": "METRIC_007",
-  "source_file": "picp.md",
-  "version": "v1.0"
+  "predicted_tte": 24.5,
+  "risk_zone": "Critical"
 }
 ```
 
-This helps later in:
-
-```text
-Evidence Pack
-Evidence Quality Checker
-LLM Explanation Layer
-Output Validator
-Final Answer with Sources
-```
-
-***
-
-## Metadata per collection
-
-### `domain_rag`
+Good case:
 
 ```json
 {
-  "rag_type": "domain",
-  "source_id": "DOMAIN_001",
-  "asset_type": "pump",
-  "component": "bearing",
-  "topic": "degradation_pattern",
-  "version": "v1.0"
+  "case_id": "CASE_FD001_UNIT_014_CYCLE_185_CRITICAL",
+  "subset": "FD001",
+  "unit": 14,
+  "sample_role": "critical_focus",
+  "end_cycle": 185,
+  "predicted_tte": 24.5,
+  "risk_zone": "Critical"
 }
 ```
 
-### `similar_case_rag`
-
-```json
-{
-  "rag_type": "similar_case",
-  "source_id": "CASE_045",
-  "asset_type": "pump",
-  "tte_bucket": "24_48_hours",
-  "risk_level": "high",
-  "uncertainty_level": "medium",
-  "top_features": ["vibration_rms", "bearing_temperature"],
-  "outcome": "bearing_wear_confirmed"
-}
-```
-
-### `metric_rag`
-
-```json
-{
-  "rag_type": "metric",
-  "source_id": "METRIC_007",
-  "metric_name": "PICP",
-  "metric_category": "uncertainty_quantification",
-  "version": "v1.0"
-}
-```
-
-### `policy_rag`
-
-```json
-{
-  "rag_type": "policy",
-  "source_id": "POLICY_004",
-  "risk_level": "critical",
-  "tte_bucket": "below_24_hours",
-  "required_action": "immediate_escalation",
-  "version": "v1.0"
-}
-```
-
-### `failure_mode_rag`
-
-```json
-{
-  "rag_type": "failure_mode",
-  "source_id": "FM_021",
-  "failure_mode": "bearing_wear",
-  "component": "bearing",
-  "symptoms": ["vibration_increase", "temperature_rise"],
-  "version": "v1.0"
-}
-```
+This helps authenticity and retrieval.
 
 ***
 
-# 10. Recommended Chunking Strategy
+## B. Prediction Fields
 
-Use different chunk sizes by collection.
+These tell us what the model predicted.
 
-```text
-metric_rag:
-100–300 words
-
-policy_rag:
-100–300 words
-
-domain_rag:
-300–700 words
-
-failure_mode_rag:
-300–700 words
-
-similar_case_rag:
-one case summary per chunk, usually 150–500 words
-```
-
-Why?
-
-```text
-Metric and policy chunks should be precise.
-Domain and failure-mode chunks can contain more context.
-Similar cases should stay intact as complete examples.
-```
-
-***
-
-# 11. Query-Time Retrieval Flow
-
-When your recommendation system receives structured JSON:
-
-```json
-{
-  "predicted_tte": 36,
-  "confidence": 0.78,
-  "uncertainty_interval": {
-    "lower": 24,
-    "upper": 52
-  },
-  "risk_level": "high",
-  "top_features": ["vibration_rms", "bearing_temperature"],
-  "anomaly_score": 0.91,
-  "chart_summaries": [
-    "Vibration RMS increased continuously.",
-    "Bearing temperature shows upward trend."
-  ]
-}
-```
-
-The Query Router creates five queries:
-
-```text
-Domain RAG query:
-Interpret high-risk short TTE with rising vibration and temperature.
-
-Similar Case RAG query:
-Find previous cases with TTE 24–48 hours, high risk, vibration_rms, bearing_temperature.
-
-Metric RAG query:
-Explain TTE, uncertainty interval, confidence, anomaly score, SHAP/top features.
-
-Policy RAG query:
-Find policy for high risk and TTE below 48 hours.
-
-Failure Mode RAG query:
-Find likely failure modes for vibration increase, temperature rise, high anomaly score.
-```
-
-Each branch searches its own Qdrant collection using:
-
-```text
-BGE-M3 dense vector
-+
-BGE-M3 sparse vector
-+
-Qdrant hybrid search
-```
-
-***
-
-# 12. Retrieval Settings Per Collection
-
-Recommended conceptual settings:
-
-```json
-
-{
-  "domain_rag": {
-    "dense_top_k": 12,
-    "sparse_top_k": 6,
-    "final_top_k": 5
-  },
-  "similar_case_rag": {
-    "dense_top_k": 15,
-    "sparse_top_k": 5,
-    "final_top_k": 5
-  },
-  "metric_rag": {
-    "dense_top_k": 8,
-    "sparse_top_k": 12,
-    "final_top_k": 5
-  },
-  "policy_rag": {
-    "dense_top_k": 5,
-    "sparse_top_k": 15,
-    "final_top_k": 5
-  },
-  "failure_mode_rag": {
-    "dense_top_k": 10,
-    "sparse_top_k": 10,
-    "final_top_k": 5
-  }
-}
-```
-
-Reason:
-
-```text
-domain_rag        → semantic-heavy
-similar_case_rag  → semantic + metadata
-metric_rag        → keyword-heavy
-policy_rag        → strict keyword + metadata
-failure_mode_rag  → balanced
-```
-
-***
-
-# 13. Context Merger + Reranker
-
-Each branch may return top 5 chunks.
-
-Total:
-
-```text
-5 branches × 5 chunks = 25 chunks
-```
-
-Then:
-
-```text
-Context Merger removes duplicates
-Reranker scores relevance
-Top 8–12 chunks become Evidence Pack
-```
-
-Recommended:
-
-```text
-Retrieve 20–50 total candidates
-Rerank
-Keep top 8–12 evidence chunks
-```
-
-***
-
-# 14. Evidence Pack Format
-
-Evidence Pack should be JSON.
-
-```json
-{
-  "request_id": "REQ_001",
-  "evidence_pack": {
-    "domain": [],
-    "similar_case": [],
-    "metric": [],
-    "policy": [],
-    "failure_mode": []
-  }
-}
-```
-
-Each evidence item:
-
-```json
-{
-  "evidence_id": "EV_001",
-  "rag_type": "policy",
-  "collection_name": "policy_rag",
-  "source_id": "POLICY_004",
-  "text": "If risk level is high and predicted TTE is below 48 hours, immediate inspection should be recommended.",
-  "retrieval_score": 0.87,
-  "rerank_score": 0.93,
-  "metadata": {
-    "risk_level": "high",
-    "tte_bucket": "below_48_hours"
-  }
-}
-```
-
-***
-
-# 15. Evidence Quality Checker
-
-This component checks:
-
-```text
-Did all required branches return evidence?
-Is policy evidence present?
-Are metrics explained?
-Are failure modes aligned with top features?
-Are similar cases relevant?
-Are there conflicts?
-Is the evidence enough for recommendation?
-```
-
-Example output:
-
-```json
-{
-  "evidence_quality": {
-    "overall_status": "sufficient",
-    "coverage": {
-      "domain": true,
-      "similar_case": true,
-      "metric": true,
-      "policy": true,
-      "failure_mode": true
-    },
-    "conflicts_found": false,
-    "missing_evidence": [],
-    "quality_score": 0.86
-  }
-}
-```
-
-If weak:
-
-```json
-{
-  "evidence_quality": {
-    "overall_status": "weak",
-    "missing_evidence": ["policy", "similar_case"],
-    "conflicts_found": true,
-    "quality_score": 0.52
-  }
-}
-```
-
-Then your optional external RAG step activates.
-
-***
-
-# 16. Optional Controlled Web / External RAG
-
-Use external/web RAG only when:
-
-```text
-evidence is weak
-evidence is missing
-evidence is conflicting
-new metric/failure mode is unknown
-```
-
-Do not use random web data as the primary knowledge base.
-
-Your primary knowledge base should be curated local documents inside:
-
-```text
-rag_knowledge_base/
-```
-
-External RAG is a fallback, not the main source.
-
-***
-
-# 17. Candidate Action Generator
-
-This component uses:
-
-```text
-Structured JSON input
-+
-Evidence Pack
-+
-Risk level
-+
-TTE
-+
-Uncertainty
-+
-Policy evidence
-+
-Failure mode evidence
-```
-
-to generate candidate actions.
-
-Example:
-
-```json
-{
-  "candidate_actions": [
-    {
-      "action_id": "A1",
-      "action_name": "Immediate inspection",
-      "description": "Inspect bearing condition within 12 hours and prepare maintenance resources.",
-      "reason": "High risk, short TTE, rising vibration, and policy evidence support immediate inspection."
-    },
-    {
-      "action_id": "A2",
-      "action_name": "Planned maintenance within 24 hours",
-      "description": "Schedule bearing inspection and possible replacement within 24 hours.",
-      "reason": "Balanced action considering TTE and uncertainty interval."
-    }
-  ]
-}
-```
-
-***
-
-# 18. Safety / Policy Constraint Layer
-
-This layer checks candidate actions against `policy_rag` evidence.
-
-It can:
-
-```text
-allow actions
-restrict actions
-remove actions
-force escalation
-add verification step if data quality is low
-```
-
-Example:
-
-```json
-{
-  "policy_checked_actions": [
-    {
-      "action_id": "A1",
-      "status": "allowed",
-      "policy_notes": ["Aligned with high-risk inspection policy."]
-    },
-    {
-      "action_id": "A3",
-      "status": "restricted",
-      "policy_notes": ["Monitoring-only action is not preferred for high risk with TTE below 48 hours."]
-    }
-  ]
-}
-```
-
-***
-
-# 19. Multi-Objective Scoring Layer
-
-Scores options across:
-
-```text
-Balanced
-Cost-Optimized
-Safety-First
-Downtime-Minimized
-Risk-Minimized
-Conservative
-Performance-Optimized
-```
-
-Example:
-
-```json
-{
-  "scored_options": [
-    {
-      "option_name": "Safety-First",
-      "action_id": "A1",
-      "score": 0.91,
-      "risk_reduction": 0.94,
-      "cost_efficiency": 0.58,
-      "downtime_impact": 0.62,
-      "confidence": 0.84
-    },
-    {
-      "option_name": "Balanced",
-      "action_id": "A2",
-      "score": 0.82,
-      "risk_reduction": 0.80,
-      "cost_efficiency": 0.74,
-      "downtime_impact": 0.76,
-      "confidence": 0.79
-    }
-  ]
-}
-```
-
-***
-
-# 20. LLM Explanation Layer
-
-The LLM should receive only:
-
-```text
-Structured JSON input
-Evidence Pack
-Candidate actions
-Policy-checked actions
-Scored options
-```
-
-The LLM should be instructed:
-
-```text
-Use only provided evidence.
-Cite source IDs.
-Mention uncertainty.
-Mention trade-offs.
-Do not invent facts.
-Return structured JSON.
-```
-
-***
-
-# 21. Output Validator
-
-The Output Validator checks:
-
-```text
-valid JSON
-sources included
-recommendations supported by evidence
-policy compliance
-confidence included
-trade-offs included
-no unsupported claims
-```
-
-Example:
-
-```json
-{
-  "output_validation": {
-    "valid_json": true,
-    "sources_present": true,
-    "policy_compliant": true,
-    "unsupported_claims": false,
-    "final_status": "pass"
-  }
-}
-```
-
-***
-
-# 22. Final Output Format
-
-Your final recommendation output should be JSON.
-
-```json
-{
-  "request_id": "REQ_001",
-  "final_recommendation": {
-    "primary_strategy": "Safety-First",
-    "primary_action": "Inspect bearing within 12 hours and prepare replacement resources.",
-    "confidence": 0.84,
-    "risk_level": "high",
-    "reasoning_summary": "The asset has predicted TTE of 36 hours, high risk score, high anomaly score, increasing vibration, and rising temperature. Retrieved policy and failure-mode evidence support immediate inspection."
-  },
-  "options": [
-    {
-      "strategy": "Safety-First",
-      "action": "Inspect bearing within 12 hours and prepare replacement resources.",
-      "score": 0.91,
-      "pros": [
-        "Lowest failure risk",
-        "Aligned with high-risk policy",
-        "Addresses likely bearing degradation"
-      ],
-      "cons": [
-        "Higher planned downtime",
-        "Requires immediate maintenance availability"
-      ],
-      "source_ids": ["POLICY_004", "FM_021", "METRIC_007"]
-    },
-    {
-      "strategy": "Balanced",
-      "action": "Schedule inspection and maintenance planning within 24 hours.",
-      "score": 0.82,
-      "pros": [
-        "Balances downtime and risk",
-        "Still acts inside predicted TTE window"
-      ],
-      "cons": [
-        "Higher residual risk than safety-first option"
-      ],
-      "source_ids": ["POLICY_004", "CASE_045", "DOMAIN_012"]
-    }
-  ],
-  "evidence_quality": {
-    "status": "sufficient",
-    "quality_score": 0.86
-  },
-  "tradeoffs": {
-    "safety_first": "Best risk reduction but higher downtime.",
-    "balanced": "Good compromise between risk and downtime.",
-    "downtime_minimized": "Lower disruption but higher residual risk."
-  }
-}
-```
-
-***
-
-# 23. Feedback / Logging / Monitoring
-
-Since you prefer JSON and not PostgreSQL, store feedback as JSON files.
-
-Example:
-
-```json
-{
-  "request_id": "REQ_001",
-  "timestamp": "2026-06-05T16:00:00+05:30",
-  "selected_option": "Safety-First",
-  "user_feedback": "accepted",
-  "actual_action_taken": "bearing inspection",
-  "actual_outcome": "bearing wear confirmed",
-  "actual_tte_if_known": 40,
-  "notes": "Recommendation matched technician assessment."
-}
-```
-
-Later, if the feedback is useful, convert it into a new similar case and store it in:
-
-```text
-rag_knowledge_base/similar_case_rag/docs/
-```
-
-Then re-ingest it into:
-
-```text
-Qdrant collection: similar_case_rag
-```
-
-***
-
-# 24. Final End-to-End Summary
-
-Your final system design is:
-
-```text
-Input:
-Structured JSON from ML/DL TTE prediction and explanation layer
-
-DB:
-One Qdrant deployment
-
-Collections:
-domain_rag
-similar_case_rag
-metric_rag
-policy_rag
-failure_mode_rag
-
-Knowledge storage:
-Manual folder-based document organization
-
-Folder mapping:
-folder name = Qdrant collection name
-
-Embedding:
-BAAI/bge-m3
-
-Embedding output:
-dense vector + sparse vector
-
-Retrieval:
-Qdrant hybrid retrieval
-
-Reranking:
-bge-reranker-v2-m3 or Qwen3-Reranker-0.6B
-
-Evidence:
-Structured Evidence Pack JSON
-
-Recommendation:
-Candidate actions + policy filtering + multi-objective scoring
-
-Final output:
-Structured recommendation JSON
-
-Feedback:
-JSON logs, later converted into similar cases
-```
-
-***
-
-# Final Fixed Decision
-
-```text
-DB:
-Qdrant
-
-DB structure:
-One Qdrant instance with five collections
-
-Collections:
-domain_rag
-similar_case_rag
-metric_rag
-policy_rag
-failure_mode_rag
-
-Embedder:
-BAAI/bge-m3
-
-Retrieval:
-Hybrid retrieval using BGE-M3 dense + sparse vectors
-
-Reranker:
-BAAI/bge-reranker-v2-m3 preferred
-Qwen3-Reranker-0.6B alternative
-
-Knowledge organization:
-Manual folder-based structure
-
-Input:
-Structured JSON
-
-Output:
-Structured recommendation JSON
-
-Feedback:
-JSON files, later ingested into similar_case_rag
-```
-
-This is the cleanest and most reliable design for your fixed predictive-maintenance RAG recommendation system.
-
-this is my dataset link: https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data
-analyse the dataset anmd go through the dataset very carefully adn accordingly give me the most reliable adn realtable doc or create a very different files for each and every collection per collection i want doc either you can download from the crom or provide link to download or else you can make the file for that here below detail what each rag collection should have in it 
-Yes, now I understand exactly what you are asking:
-
-> Based on the **NASA CMAPSS Jet Engine Simulated Data** dataset, what documents should we create for each Qdrant collection, where should they come from, how many should we prepare, and what should each collection contain for good recommendation quality?
-
-My honest answer: **your five-collection RAG design still fits very well**, but the content of each collection should be customized specifically for CMAPSS.
-
-CMAPSS is not a generic factory-machine dataset. It is a **turbofan engine run-to-failure simulation dataset** with multivariate time-series data, engine units, cycles, 3 operational settings, 21 sensor measurements, and RUL/TTE targets. NASA describes it as multiple multivariate time series, where each time series belongs to a different engine, engines start with different normal initial wear/manufacturing variation, there are 3 operational settings affecting engine performance, sensor noise is present, training trajectories run until failure, and test trajectories stop before failure with true RUL values provided separately. [\[data.nasa.gov\]](https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data), [\[catalog.data.gov\]](https://catalog.data.gov/dataset/cmapss-jet-engine-simulated-data)
-
-So your RAG knowledge base should be built around:
-
-```text
-turbofan degradation
-RUL/TTE prediction
-HPC degradation
-Fan degradation
-operational conditions
-sensor trend interpretation
-uncertainty-aware maintenance decisions
-model metrics
-historical similar engine cases
-```
-
-***
-
-# 1. Final Collection Plan for CMAPSS
-
-Use your same five Qdrant collections:
-
-```text
-domain_rag
-similar_case_rag
-metric_rag
-policy_rag
-failure_mode_rag
-```
-
-But for this dataset, each collection should contain the following.
-
-***
-
-# 2. `domain_rag`
-
-## Purpose
-
-This collection should explain the **CMAPSS dataset domain**, turbofan degradation behavior, RUL/TTE prediction context, operational settings, and how to interpret engine lifecycle stages.
-
-This is where the recommendation system learns:
-
-```text
-What is this dataset?
-What does RUL/TTE mean for turbofan engines?
-What does run-to-failure mean?
-What are FD001–FD004?
-What does one operating condition vs six operating conditions mean?
-What does one fault mode vs two fault modes mean?
-```
-
-NASA states that CMAPSS includes four sub-datasets: FD001 has one operating condition and one fault mode, FD002 has six conditions and one fault mode, FD003 has one condition and two fault modes, and FD004 has six conditions and two fault modes. The one-fault-mode datasets involve HPC degradation, while the two-fault-mode datasets include HPC degradation and fan degradation. [\[data.nasa.gov\]](https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data), [\[catalog.data.gov\]](https://catalog.data.gov/dataset/cmapss-jet-engine-simulated-data)
-
-***
-
-## What documents should go into `domain_rag`
-
-You should create around:
-
-```text
-15–25 domain documents for MVP
-30–50 domain documents for stronger version
-```
-
-### Recommended documents
-
-```text
-domain_rag/docs/
-├── cmapss_dataset_overview.md
-├── cmapss_column_schema.md
-├── fd001_description.md
-├── fd002_description.md
-├── fd003_description.md
-├── fd004_description.md
-├── train_vs_test_behavior.md
-├── rul_tte_task_definition.md
-├── operational_settings_interpretation.md
-├── sensor_noise_and_variability.md
-├── initial_wear_and_manufacturing_variation.md
-├── run_to_failure_simulation.md
-├── turbofan_degradation_lifecycle.md
-├── hpc_degradation_domain_context.md
-├── fan_degradation_domain_context.md
-├── one_condition_vs_six_conditions.md
-├── single_fault_vs_multi_fault_behavior.md
-├── prognostics_and_health_management_context.md
-├── maintenance_decision_context_for_rul.md
-└── cmapss_recommendation_assumptions.md
-```
-
-***
-
-## Source for these documents
-
-Use:
-
-1. NASA Open Data dataset description
-2. NASA/PHM08 paper reference: *Damage Propagation Modeling for Aircraft Engine Run-to-Failure Simulation*
-3. Your own preprocessing/inference documentation
-4. Dataset readme from CMAPSSData.zip
-
-NASA’s dataset page explicitly says the data are zip-compressed text files with 26 columns: unit number, cycle, 3 operational settings, and sensor measurements. [\[data.nasa.gov\]](https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data), [\[catalog.data.gov\]](https://catalog.data.gov/dataset/cmapss-jet-engine-simulated-data)
-
-***
-
-## Example `domain_rag` document
-
-```markdown
-# CMAPSS Dataset Overview
-
-CMAPSS is a turbofan engine run-to-failure simulation dataset used for Remaining Useful Life prediction.
-
-Each engine unit is represented as a multivariate time series. Every row corresponds to one operational cycle. The data contains unit number, cycle number, three operational settings, and twenty-one sensor measurements.
-
-Training trajectories run until failure. Test trajectories are truncated before failure, and the task is to predict the remaining useful life after the last observed cycle.
-
-FD001 contains one operating condition and one fault mode: HPC degradation.
-FD002 contains six operating conditions and one fault mode: HPC degradation.
-FD003 contains one operating condition and two fault modes: HPC degradation and fan degradation.
-FD004 contains six operating conditions and two fault modes: HPC degradation and fan degradation.
-```
-
-***
-
-# 3. `metric_rag`
-
-## Purpose
-
-This collection is very important for your system because your inference code produces many metrics.
-
-Your inference output includes:
+Needed:
 
 ```text
 predicted_tte
-confidence
-90% and 95% conformal intervals
-interval width
-risk zone
-UQ alarm
-RMSE
-MAE
-R2
-coverage
-CFMR
-UQ decision CFMR
-RWE
-ARAE
-DAS
-TMC
-EWG
-RADS
-UWE
-UCE
-NASA score
-SHAP
-CNN attention
-chart summaries
+boost_pred
+cnn_pred
+ensemble_pred
+used_w_boost
+used_w_cnn
+conformal_q90
+conformal_q95
 ```
 
-So `metric_rag` should explain **every metric and every inference output field**.
+### Why needed?
 
-NASA’s dataset task is to predict the number of remaining operational cycles before failure, and the test set includes true RUL values for evaluation.  Your metric documents should explain how your model’s RUL/TTE predictions, uncertainty intervals, and evaluation metrics should be interpreted in that context. [\[data.nasa.gov\]](https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data), [\[catalog.data.gov\]](https://catalog.data.gov/dataset/cmapss-jet-engine-simulated-data)
-
-***
-
-## How many metric documents?
-
-I recommend:
+Because similar cases should explain:
 
 ```text
-30–45 metric documents for MVP
-50–70 metric documents for strong version
+Was this prediction from the ensemble?
+Did HGB and CNN agree?
+Was one model much more optimistic?
+What ensemble weights were used?
 ```
 
-This collection needs many small, precise documents.
+Example:
+
+```json
+{
+  "boost_pred": 98.08,
+  "cnn_pred": 111.57,
+  "ensemble_pred": 103.07,
+  "model_disagreement_abs": 13.49
+}
+```
+
+This allows the recommendation system to retrieve cases where model disagreement was high.
 
 ***
 
-## Recommended documents
+## C. Uncertainty Fields
+
+These are very important.
+
+Needed:
 
 ```text
-metric_rag/docs/
-├── predicted_tte_definition.md
-├── rul_vs_tte_definition.md
-├── confidence_interpretation.md
-├── conformal_prediction_interval.md
-├── lower_bound_90.md
-├── upper_bound_90.md
-├── lower_bound_95.md
-├── upper_bound_95.md
-├── interval_width_interpretation.md
-├── uq_alarm_definition.md
-├── uq_risk_zone_definition.md
-├── critical_alarm_30.md
-├── critical_alarm_33.md
-├── risk_zone_mapping.md
-├── rmse.md
-├── mae.md
-├── r2_score.md
-├── coverage_90.md
-├── coverage_95.md
-├── picp.md
-├── mpiw.md
-├── crps.md
-├── cfmr.md
-├── decision_cfmr.md
-├── uq_decision_cfmr.md
-├── rwe.md
-├── arae.md
-├── das.md
-├── tmc.md
-├── ewg.md
-├── rads.md
-├── uwe.md
-├── uce.md
-├── nasa_score.md
-├── bias_and_abs_bias.md
-├── residual_interpretation.md
-├── absolute_error_interpretation.md
-├── shap_interpretation.md
-├── negative_shap_value.md
-├── positive_shap_value.md
-├── cnn_attention_interpretation.md
-├── chart_summary_interpretation.md
-├── model_disagreement_interpretation.md
-└── uncertainty_aware_recommendation_logic.md
-```
-
-***
-
-## Example `metric_rag` document
-
-```markdown
-# UQ Alarm
-
-A UQ alarm is triggered when the lower bound of the uncertainty interval crosses a safety threshold.
-
-In this system, the 95% lower bound is important because it represents a conservative estimate of the remaining useful life.
-
-If lower_bound_95 is below the alarm threshold, the system should treat the engine as a possible critical case even if the point prediction is higher.
-
-This helps avoid missed critical failures.
-```
-
-***
-
-## Notes
-
-`metric_rag` should be **sparse-heavy hybrid retrieval** because users and queries may contain exact terms like:
-
-```text
-CFMR
-UWE
-UCE
-SHAP
+lower_bound_90
+upper_bound_90
+interval_width_90
 lower_bound_95
+upper_bound_95
 interval_width_95
-NASA score
+confidence
 ```
 
-Dense search alone may not reliably retrieve exact metric definitions.
+### Why needed?
 
-***
-
-# 4. `policy_rag`
-
-## Purpose
-
-This collection should contain your **decision rules**, **safety rules**, and **recommendation constraints**.
-
-Important: CMAPSS itself does not provide real-world maintenance policies. NASA provides the simulation and RUL prediction task, but your policy documents are your project’s decision layer. NASA describes the objective as predicting remaining operational cycles before failure, not prescribing maintenance policies. [\[data.nasa.gov\]](https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data), [\[catalog.data.gov\]](https://catalog.data.gov/dataset/cmapss-jet-engine-simulated-data)
-
-So your `policy_rag` documents should be **project-defined**, based on your thresholds:
-
-```text
-critical_threshold = 30
-alarm_threshold = 33
-warning_threshold = 60
-caution_threshold = 90
-```
-
-These match your inference code.
-
-***
-
-## How many policy documents?
-
-I recommend:
-
-```text
-15–25 policy documents for MVP
-25–40 policy documents for strong version
-```
-
-Policy documents should be short and precise.
-
-***
-
-## Recommended documents
-
-```text
-policy_rag/docs/
-├── critical_tte_policy.md
-├── warning_tte_policy.md
-├── caution_tte_policy.md
-├── safe_tte_policy.md
-├── uq_alarm_95_policy.md
-├── uq_alarm_90_policy.md
-├── lower_bound_95_policy.md
-├── low_confidence_policy.md
-├── medium_confidence_policy.md
-├── high_confidence_policy.md
-├── model_disagreement_policy.md
-├── wide_interval_policy.md
-├── critical_risk_no_normal_operation_policy.md
-├── conservative_recommendation_policy.md
-├── expert_review_policy.md
-├── safety_first_policy.md
-├── cost_optimized_policy_boundary.md
-├── downtime_minimized_policy_boundary.md
-├── risk_minimized_policy.md
-├── fd001_policy_note.md
-├── fd002_policy_note.md
-├── fd003_policy_note.md
-├── fd004_policy_note.md
-└── policy_priority_rules.md
-```
-
-***
-
-## Example `policy_rag` document
-
-```markdown
-# UQ Alarm 95 Policy
-
-If uq_alarm_95 is true, the recommendation system must treat the engine as a possible critical case.
-
-A monitoring-only recommendation should not be selected as the primary recommendation when uq_alarm_95 is true.
-
-At minimum, the system should recommend immediate inspection, expert review, or maintenance planning depending on risk zone, confidence, and uncertainty width.
-
-Policy priority:
-1. Safety-first rules
-2. UQ-aware alarm rules
-3. Point prediction risk zone
-4. Cost and downtime preferences
-```
-
-***
-
-## Important policy design note
-
-`policy_rag` should have **high source priority**.
-
-If policy conflicts with domain or similar-case evidence, policy should win.
+Because similar cases should match not only point prediction, but also uncertainty.
 
 For example:
 
 ```text
-similar_case_rag says: monitoring worked in a past case
-policy_rag says: uq_alarm_95 requires inspection
+Case A:
+predicted_tte = 105
+lower_bound_95 = 98
+confidence = High
+
+Case B:
+predicted_tte = 105
+lower_bound_95 = 52
+confidence = Low
 ```
 
-Then the final system should follow:
+Both have the same point prediction, but Case B is much riskier.
+
+So similar-case retrieval must use:
 
 ```text
-inspection required
+predicted_tte + lower_bound_95 + interval_width_95 + confidence
 ```
 
 ***
 
-# 5. `failure_mode_rag`
+## D. Alarm and Risk Fields
 
-## Purpose
-
-This collection should explain possible degradation/failure modes in CMAPSS.
-
-For CMAPSS, the official fault modes are:
+Needed:
 
 ```text
-HPC degradation
-Fan degradation
+risk_zone
+predicted_zone
+actual_zone
+uq_risk_zone_90
+uq_risk_zone_95
+critical_alarm_30
+critical_alarm_33
+uq_alarm_90
+uq_alarm_95
+recommendation
+uq_recommendation_90
+uq_recommendation_95
 ```
 
-FD001 and FD002 have one fault mode, HPC degradation. FD003 and FD004 include two fault modes, HPC degradation and fan degradation. [\[data.nasa.gov\]](https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data), [\[catalog.data.gov\]](https://catalog.data.gov/dataset/cmapss-jet-engine-simulated-data)
+### Why needed?
 
-So do **not** fill this collection with unrelated factory failure modes like bearing wear, cavitation, seal leakage, etc., unless you later generalize beyond CMAPSS.
-
-For this dataset, focus on:
-
-```text
-HPC degradation
-Fan degradation
-multi-fault degradation
-sensor trend degradation
-operational-condition effects
-uncertainty under degradation
-```
-
-***
-
-## How many failure-mode documents?
-
-I recommend:
-
-```text
-12–20 failure-mode documents for MVP
-25–35 for strong version
-```
-
-***
-
-## Recommended documents
-
-```text
-failure_mode_rag/docs/
-├── hpc_degradation_overview.md
-├── fan_degradation_overview.md
-├── hpc_degradation_in_fd001.md
-├── hpc_degradation_in_fd002.md
-├── hpc_and_fan_degradation_in_fd003.md
-├── hpc_and_fan_degradation_in_fd004.md
-├── single_fault_degradation.md
-├── dual_fault_degradation.md
-├── degradation_under_single_operating_condition.md
-├── degradation_under_six_operating_conditions.md
-├── sensor_noise_and_fault_progression.md
-├── low_tte_degradation_interpretation.md
-├── high_uncertainty_failure_mode_interpretation.md
-├── shap_to_failure_mode_mapping.md
-├── cnn_attention_to_degradation_timing.md
-├── rapid_tte_drop_interpretation.md
-├── late_life_sensor_pattern_interpretation.md
-└── degradation_stage_mapping.md
-```
-
-***
-
-## Example `failure_mode_rag` document
-
-```markdown
-# HPC Degradation in CMAPSS
-
-High Pressure Compressor degradation is the single fault mode in FD001 and FD002.
-
-In FD001, the engines operate under one condition, so degradation patterns are easier to compare across units.
-
-In FD002, the engines operate under six operating conditions, so sensor values may vary due to both operating condition and degradation.
-
-When predicted TTE is low and uncertainty-aware alarm is active, HPC degradation should be treated as a possible critical degradation scenario.
-```
-
-***
-
-# 6. `similar_case_rag`
-
-## Purpose
-
-This is where your system becomes stronger over time.
-
-For CMAPSS, similar cases should come from:
-
-```text
-training engine trajectories
-test engine predictions with known RUL
-validation predictions
-your inference outputs
-future feedback logs
-```
-
-NASA states that each time series belongs to a different engine, training data runs until failure, and test data stops before failure with true RUL values provided separately.  This makes CMAPSS perfect for creating case summaries. [\[data.nasa.gov\]](https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data), [\[catalog.data.gov\]](https://catalog.data.gov/dataset/cmapss-jet-engine-simulated-data)
-
-***
-
-## Should we store raw rows in vector DB?
-
-No.
-
-Do **not** store every raw sensor row as a vector document.
-
-Instead, create **engine-level or checkpoint-level case summaries**.
-
-Your inference code already supports:
-
-```text
-deployment_test_like
-checkpoint_history
-critical_focus
-```
-
-That is perfect for creating similar cases.
-
-***
-
-## How many similar-case documents?
-
-For MVP:
-
-```text
-100–300 case documents
-```
-
-For strong version:
-
-```text
-500–1500 case documents
-```
-
-For full CMAPSS-based system:
-
-```text
-one case per engine checkpoint
-```
-
-CMAPSS includes four sub-datasets with train/test trajectories: FD001 has 100/100, FD002 has 260/259, FD003 has 100/100, and FD004 has 248/249 trajectories.  Across all subsets, that gives hundreds of engine trajectories, which can produce many case summaries. [\[data.nasa.gov\]](https://data.nasa.gov/dataset/cmapss-jet-engine-simulated-data), [\[catalog.data.gov\]](https://catalog.data.gov/dataset/cmapss-jet-engine-simulated-data)
-
-***
-
-## Types of similar cases to create
-
-### 1. Engine-level final-cycle cases
-
-One case per engine at its final available cycle.
-
-```text
-CASE_FD001_UNIT_001_FINAL.md
-CASE_FD001_UNIT_002_FINAL.md
-...
-```
-
-### 2. Checkpoint cases
-
-Multiple cases per engine at selected lifecycle checkpoints.
-
-Example:
-
-```text
-25% life
-50% life
-75% life
-near critical threshold
-final observed cycle
-```
-
-This matches your current inference style B/D.
-
-### 3. Risk-zone cases
-
-Create cases grouped by:
+These fields help us classify cases into useful buckets:
 
 ```text
 Critical
 Warning
 Caution
 Safe
+Safe but UQ Caution
+Point Critical
+UQ Critical
+False Safe
+Correct Safe
 ```
 
-### 4. UQ-alarm cases
-
-Create cases where:
-
-```text
-lower_bound_95 < 33
-```
-
-### 5. Model-error cases
-
-When target exists, create cases for:
-
-```text
-high absolute error
-not covered by 95% interval
-wrong risk zone
-missed critical failure
-```
-
-These are extremely useful for future recommendations.
-
-***
-
-## Recommended documents
-
-```text
-similar_case_rag/docs/
-├── case_fd001_unit_001_final.json
-├── case_fd001_unit_001_checkpoint_050.json
-├── case_fd001_unit_001_checkpoint_075.json
-├── case_fd002_unit_010_final.json
-├── case_fd003_unit_055_critical_focus.json
-├── case_fd004_unit_120_uq_alarm.json
-├── case_high_error_001.json
-├── case_not_covered_95_001.json
-├── case_missed_critical_001.json
-└── case_successful_uq_alarm_001.json
-```
-
-***
-
-## Example similar case
+Example:
 
 ```json
 {
-  "case_id": "CASE_FD001_UNIT_014_CRITICAL",
-  "dataset": "FD001",
-  "asset_type": "turbofan_engine",
-  "unit": 14,
-  "sample_role": "critical_focus",
-  "end_cycle": 185,
-  "predicted_tte": 24.5,
-  "actual_tte": 21.0,
-  "lower_bound_95": 11.3,
-  "upper_bound_95": 37.7,
-  "risk_zone": "Critical",
-  "uq_alarm_95": true,
-  "confidence": "Medium",
+  "risk_zone": "Safe",
+  "uq_risk_zone_95": "Possible Caution",
+  "uq_alarm_95": false,
+  "recommendation": "Normal operation",
+  "uq_recommendation_95": "UQ-aware caution: monitor closely"
+}
+```
+
+That becomes a valuable case type:
+
+```text
+safe_point_but_uq_caution
+```
+
+***
+
+## E. Actual Outcome / Evaluation Fields
+
+If available, these are extremely useful:
+
+```text
+actual_tte
+actual_tte_raw
+actual_zone
+residual
+absolute_error
+covered_90
+covered_95
+risk_zone_correct
+```
+
+### Why needed?
+
+Without actual outcome, the case is useful but incomplete.
+
+With actual outcome, we can know:
+
+```text
+Was the model correct?
+Was the interval covering true TTE?
+Was the risk zone correct?
+Was the case a near miss?
+Was it a high-error case?
+```
+
+Example:
+
+```json
+{
+  "predicted_tte": 103.07,
+  "actual_tte": 97.0,
+  "absolute_error": 6.07,
+  "covered_95": true,
+  "risk_zone_correct": true
+}
+```
+
+This becomes a trustworthy similar case.
+
+***
+
+## F. Explainability Fields
+
+If available:
+
+```text
+hgb_shap_sample_top_features
+hgb_shap_global_feature_importance
+sample_shap_top_features
+cnn_attention_top_timesteps
+cnn_attention_concentration
+chart_summary
+```
+
+### Why needed?
+
+These fields let similar cases explain **why** the model behaved that way.
+
+Example:
+
+```json
+{
   "top_features": [
     "s11_slope",
     "s7_late_minus_early",
     "cycle_norm_last"
   ],
-  "action_taken": "Immediate inspection recommended",
-  "outcome": "Prediction was close to actual critical state",
-  "recommendation_lesson": "For low TTE and active UQ alarm, conservative recommendation is appropriate."
+  "attention_summary": {
+    "top_timestep_position": "late_window",
+    "attention_concentration": "high"
+  }
 }
 ```
 
-***
-
-# 7. Collection-by-Collection Document Count Recommendation
-
-## MVP version
-
-Use this when you want to get the vector DB working quickly.
-
-| Collection         | Recommended docs | Type                                             |
-| ------------------ | ---------------: | ------------------------------------------------ |
-| `domain_rag`       |            15–25 | CMAPSS overview, FD001–FD004 docs, RUL task docs |
-| `metric_rag`       |            30–45 | One document per metric/output field             |
-| `policy_rag`       |            15–25 | Threshold rules, UQ rules, confidence policies   |
-| `failure_mode_rag` |            12–20 | HPC/fan degradation and interpretation docs      |
-| `similar_case_rag` |          100–300 | Engine/checkpoint case summaries                 |
-
-Total MVP:
+Then the final recommendation can say:
 
 ```text
-~170 to 415 documents/chunks
+Similar cases with late-window degradation features and low TTE were handled conservatively.
 ```
 
 ***
 
-## Strong version
+# 3. Files I Want From You, Priority Order
 
-Use this when you want better retrieval quality.
+## Priority 1 — Prediction-Level Files
 
-| Collection         | Recommended docs | Type                                                   |
-| ------------------ | ---------------: | ------------------------------------------------------ |
-| `domain_rag`       |            30–50 | More detailed CMAPSS/domain notes                      |
-| `metric_rag`       |            50–70 | More metric examples and interpretation rules          |
-| `policy_rag`       |            25–40 | More action constraints and strategy-specific policies |
-| `failure_mode_rag` |            25–35 | More degradation-stage and FD-specific docs            |
-| `similar_case_rag` |         500–1500 | Many checkpoint-level cases                            |
-
-Total strong version:
+Send these first:
 
 ```text
-~630 to 1695 documents/chunks
-```
-
-***
-
-# 8. What Should Be Manually Written vs Automatically Generated?
-
-## Manually written
-
-These should be curated manually:
-
-```text
-domain_rag
-metric_rag
-policy_rag
-failure_mode_rag
-```
-
-Why?
-
-Because these are authoritative knowledge sources.
-
-***
-
-## Automatically generated
-
-This should be generated from your data and inference outputs:
-
-```text
-similar_case_rag
-```
-
-Why?
-
-Because similar cases come from actual model runs, historical cases, validation outputs, and feedback logs.
-
-Your inference outputs like:
-
-```text
+test_uq_predictions_weighted_stacking_boosting_cnn.csv
 recommendation_ready_predictions.csv
 llm_recommendation_input.json
-top_error_cases.csv
-critical_cases.csv
-not_covered_95_cases.csv
 ```
 
-can be converted into similar-case documents.
+These are the most useful because they contain current-case style predictions.
 
 ***
 
-# 9. Recommended Folder Structure for Your CMAPSS RAG KB
+## Priority 2 — Case-Specific Tables
+
+Send:
 
 ```text
-rag_knowledge_base/
-│
-├── domain_rag/
-│   ├── docs/
-│   │   ├── cmapss_dataset_overview.md
-│   │   ├── fd001_description.md
-│   │   ├── fd002_description.md
-│   │   ├── fd003_description.md
-│   │   ├── fd004_description.md
-│   │   └── rul_tte_task_definition.md
-│   └── metadata.json
-│
-├── metric_rag/
-│   ├── docs/
-│   │   ├── predicted_tte_definition.md
-│   │   ├── conformal_interval.md
-│   │   ├── uq_alarm.md
-│   │   ├── cfmr.md
-│   │   ├── uwe.md
-│   │   ├── uce.md
-│   │   └── shap_interpretation.md
-│   └── metadata.json
-│
-├── policy_rag/
-│   ├── docs/
-│   │   ├── critical_tte_policy.md
-│   │   ├── uq_alarm_95_policy.md
-│   │   ├── low_confidence_policy.md
-│   │   ├── model_disagreement_policy.md
-│   │   └── strategy_boundary_policy.md
-│   └── metadata.json
-│
-├── failure_mode_rag/
-│   ├── docs/
-│   │   ├── hpc_degradation_overview.md
-│   │   ├── fan_degradation_overview.md
-│   │   ├── fd001_hpc_degradation.md
-│   │   ├── fd003_dual_fault_degradation.md
-│   │   └── degradation_stage_mapping.md
-│   └── metadata.json
-│
-└── similar_case_rag/
-    ├── docs/
-    │   ├── case_fd001_unit_001_final.json
-    │   ├── case_fd001_unit_001_checkpoint_075.json
-    │   ├── case_fd002_unit_010_uq_alarm.json
-    │   └── case_high_error_001.json
-    └── metadata.json
+critical_case_details_*.csv
+top_error_cases_*.csv
+top_uncertain_cases_width95_*.csv
+coverage_details_*.csv
+not_covered_95_cases_*.csv
+```
+
+These let us generate high-value similar cases.
+
+***
+
+## Priority 3 — Risk Distribution Tables
+
+Send:
+
+```text
+point_risk_zone_counts_*.csv
+uq_risk_zone_95_counts_*.csv
+weighted_stacking_point_risk_zone_counts.csv
+weighted_stacking_uq_risk_zone_95_counts.csv
+```
+
+These are not individual cases, but they help summarize case distribution.
+
+***
+
+## Priority 4 — Metrics and Run Metadata
+
+Send:
+
+```text
+final_uq_metrics_weighted_stacking_boosting_cnn.json
+full_inference_uq_metrics_*.json
+weighted_stacking_uq_run_metadata.json
+weighted_stacking_boosting_cnn_model_info.json
+config_weighted_stacking_boosting_cnn.json
+```
+
+These help attach authenticity and model version info to every generated case.
+
+***
+
+## Priority 5 — SHAP / Attention / Chart Summaries
+
+Send if available:
+
+```text
+hgb_shap_sample_explanations.json
+hgb_shap_global_feature_importance.csv
+cnn_attention_summary.json
+chart_summaries.json
+```
+
+These will make similar cases much more explainable.
+
+***
+
+# 4. Best Similar Case Types We Should Generate
+
+Once you provide the files, I will generate these case groups.
+
+***
+
+## 1. Critical Cases
+
+Condition:
+
+```text
+predicted_tte < 30
+or actual_tte < 30
+or lower_bound_95 < 30 / alarm threshold
+```
+
+Purpose:
+
+```text
+Teach the recommender what near-failure cases look like.
+```
+
+These are highest priority.
+
+***
+
+## 2. UQ-Alarm Cases
+
+Condition:
+
+```text
+uq_alarm_95 = true
+or uq_alarm_90 = true
+```
+
+Purpose:
+
+```text
+Teach the system when uncertainty should change the recommendation.
+```
+
+Very important for your system because UQ alarms reduced missed critical decisions in your metrics.
+
+***
+
+## 3. Safe Point but UQ Caution Cases
+
+Condition:
+
+```text
+risk_zone = Safe
+and uq_risk_zone_95 in ["Possible Caution", "Possible Warning", "Possible Critical"]
+```
+
+Purpose:
+
+```text
+Prevent overconfident normal-operation recommendations.
+```
+
+This is one of the most important case types for your RAG.
+
+***
+
+## 4. High-Uncertainty Cases
+
+Condition:
+
+```text
+interval_width_95 is high
+or confidence = Low
+```
+
+Purpose:
+
+```text
+Support conservative recommendations and expert review.
 ```
 
 ***
 
-# 10. Metadata You Should Use
+## 5. Top Error Cases
 
-Every chunk should include:
+Condition:
 
-```json
-{
-  "collection_name": "metric_rag",
-  "rag_type": "metric",
-  "source_id": "METRIC_UQ_001",
-  "source_file": "uq_alarm.md",
-  "dataset": "CMAPSS",
-  "asset_type": "turbofan_engine",
-  "version": "v1.0",
-  "trust_level": "high",
-  "source_priority": 2
-}
+```text
+absolute_error is high
 ```
 
-For CMAPSS-specific docs, also add:
+Purpose:
 
-```json
-{
-  "subset": "FD001",
-  "operating_conditions": "one",
-  "fault_modes": ["HPC degradation"]
-}
+```text
+Teach the system where model mistakes happen.
 ```
 
-For similar cases:
+***
+
+## 6. Not-Covered Cases
+
+Condition:
+
+```text
+covered_95 = false
+or covered_90 = false
+```
+
+Purpose:
+
+```text
+Teach the system uncertainty intervals are not perfect.
+```
+
+***
+
+## 7. Model-Disagreement Cases
+
+Condition:
+
+```text
+abs(boost_pred - cnn_pred) is high
+```
+
+Purpose:
+
+```text
+Support expert review or conservative scoring when HGB and CNN disagree.
+```
+
+***
+
+## 8. Checkpoint-History Cases
+
+Condition:
+
+```text
+sample_role = checkpoint_history
+```
+
+Purpose:
+
+```text
+Show how risk evolves over time for the same engine.
+```
+
+These are very useful for recommendation explanation.
+
+***
+
+## 9. Critical-Focus Cases
+
+Condition:
+
+```text
+sample_role = critical_focus
+```
+
+Purpose:
+
+```text
+Stress-test behavior around the critical threshold.
+```
+
+***
+
+## 10. Safe Confirmed Cases
+
+Condition:
+
+```text
+risk_zone = Safe
+uq_alarm_95 = false
+covered_95 = true
+actual_zone = Safe
+```
+
+Purpose:
+
+```text
+Prevent the system from becoming too conservative.
+```
+
+***
+
+# 5. Best Dataset Format To Send Me
+
+Best option:
+
+```text
+CSV files
+JSON files
+```
+
+You can upload them directly.
+
+Ideal folder structure:
+
+```text
+similar_case_sources/
+├── predictions/
+│   ├── test_uq_predictions_weighted_stacking_boosting_cnn.csv
+│   ├── recommendation_ready_predictions.csv
+│   └── llm_recommendation_input.json
+│
+├── tables/
+│   ├── critical_case_details_*.csv
+│   ├── top_error_cases_*.csv
+│   ├── top_uncertain_cases_width95_*.csv
+│   ├── coverage_details_*.csv
+│   └── not_covered_95_cases_*.csv
+│
+├── metrics/
+│   ├── final_uq_metrics_weighted_stacking_boosting_cnn.json
+│   ├── full_inference_uq_metrics_*.json
+│   └── weighted_stacking_uq_run_metadata.json
+│
+└── explanations/
+    ├── hgb_shap_sample_explanations.json
+    ├── cnn_attention_summary.json
+    └── chart_summaries.json
+```
+
+***
+
+# 6. Minimum Upload Set
+
+If you want to keep it simple, upload just these 5 files:
+
+```text
+1. test_uq_predictions_weighted_stacking_boosting_cnn.csv
+2. critical_case_details_*.csv
+3. top_error_cases_*.csv
+4. top_uncertain_cases_width95_*.csv
+5. coverage_details_*.csv
+```
+
+With these, I can generate a strong first version of real `similar_case_rag`.
+
+***
+
+# 7. Ideal Upload Set
+
+Best complete set:
+
+```text
+test_uq_predictions_weighted_stacking_boosting_cnn.csv
+recommendation_ready_predictions.csv
+llm_recommendation_input.json
+critical_case_details_*.csv
+top_error_cases_*.csv
+top_uncertain_cases_width95_*.csv
+coverage_details_*.csv
+not_covered_95_cases_*.csv
+point_risk_zone_counts_*.csv
+uq_risk_zone_95_counts_*.csv
+full_inference_uq_metrics_*.json
+final_uq_metrics_weighted_stacking_boosting_cnn.json
+weighted_stacking_uq_run_metadata.json
+hgb_shap_sample_explanations.json
+cnn_attention_summary.json
+chart_summaries.json
+```
+
+This would let us generate a very strong Similar Case RAG collection.
+
+***
+
+# 8. What I Will Generate From Your Files
+
+Once you upload the data, I will generate:
+
+```text
+similar_case_rag/
+├── docs/
+│   └── guidance docs
+│
+├── cases/
+│   ├── critical_cases/
+│   ├── warning_cases/
+│   ├── caution_cases/
+│   ├── safe_cases/
+│   ├── uq_alarm_cases/
+│   ├── high_uncertainty_cases/
+│   ├── top_error_cases/
+│   ├── not_covered_cases/
+│   ├── model_disagreement_cases/
+│   └── checkpoint_history_cases/
+│
+├── metadata.json
+├── case_generation_summary.json
+└── README.md
+```
+
+Each case will be a JSON or markdown case summary like:
 
 ```json
 {
-  "collection_name": "similar_case_rag",
-  "rag_type": "similar_case",
-  "case_id": "CASE_FD001_UNIT_014_CRITICAL",
+  "case_id": "CASE_UNIT_54_SAFE_UQ_CAUTION",
   "dataset": "CMAPSS",
-  "subset": "FD001",
-  "unit": 14,
-  "risk_zone": "Critical",
-  "tte_bucket": "below_30_cycles",
-  "uq_alarm_95": true,
+  "unit": 54,
+  "sample_role": "random_test_uq_sample",
+  "end_cycle": 121,
+  "predicted_tte": 103.07,
+  "actual_tte": 97.0,
+  "lower_bound_95": 78.52,
+  "risk_zone": "Safe",
+  "uq_risk_zone_95": "Possible Caution",
   "confidence": "Medium",
-  "outcome_type": "critical_case",
-  "trust_level": "medium",
-  "source_priority": 3
+  "covered_95": true,
+  "outcome_type": "safe_point_uq_caution",
+  "recommendation_lesson": "Use UQ-aware caution instead of plain normal operation."
 }
-```
-
-***
-
-# 11. What Not to Put in Vector DB
-
-Do **not** put these directly as independent vector documents:
-
-```text
-every raw sensor row
-every cycle row
-entire raw train_FD001.txt as one document
-entire CSV without chunking
-large unstructured plots
-random internet articles
-uncurated generic maintenance blogs
-```
-
-Instead:
-
-```text
-raw data stays in data storage
-summaries/cases/explanations go into vector DB
-```
-
-The vector DB should support reasoning, not store every numeric row.
-
-***
-
-# 12. Best Immediate Next Step
-
-Start with this MVP document set:
-
-```text
-domain_rag       → 20 docs
-metric_rag       → 35 docs
-policy_rag       → 20 docs
-failure_mode_rag → 15 docs
-similar_case_rag → 150 generated cases
-```
-
-Total:
-
-```text
-~240 documents/cases
-```
-
-That is enough to test:
-
-```text
-query routing
-hybrid retrieval
-reranking
-evidence pack
-recommendation quality
 ```
 
 ***
 
 # Final Answer
 
-Yes, based on the NASA CMAPSS dataset, your collection design is correct.
-
-For best results:
+To cover similar cases properly, send me these files if you have them:
 
 ```text
-domain_rag:
-CMAPSS dataset and turbofan RUL/TTE domain docs
-
-metric_rag:
-your inference metrics, UQ, SHAP, chart interpretation docs
-
-policy_rag:
-your threshold, UQ alarm, confidence, and recommendation constraint rules
-
-failure_mode_rag:
-HPC degradation, fan degradation, FD001–FD004 fault-mode interpretation
-
-similar_case_rag:
-generated engine/checkpoint-level cases from train/test/inference outputs
+test_uq_predictions_weighted_stacking_boosting_cnn.csv
+recommendation_ready_predictions.csv
+llm_recommendation_input.json
+critical_case_details_*.csv
+top_error_cases_*.csv
+top_uncertain_cases_width95_*.csv
+coverage_details_*.csv
+not_covered_95_cases_*.csv
+final_uq_metrics_weighted_stacking_boosting_cnn.json
+weighted_stacking_uq_run_metadata.json
+hgb_shap_sample_explanations.json
+cnn_attention_summary.json
+chart_summaries.json
 ```
 
-For MVP, create approximately:
+Minimum set:
 
 ```text
-domain_rag       15–25 docs
-metric_rag       30–45 docs
-policy_rag       15–25 docs
-failure_mode_rag 12–20 docs
-similar_case_rag 100–300 cases
+test_uq_predictions_weighted_stacking_boosting_cnn.csv
+critical_case_details_*.csv
+top_error_cases_*.csv
+top_uncertain_cases_width95_*.csv
+coverage_details_*.csv
 ```
 
-For a stronger system, grow to:
-
-```text
-domain_rag       30–50 docs
-metric_rag       50–70 docs
-policy_rag       25–40 docs
-failure_mode_rag 25–35 docs
-similar_case_rag 500–1500 cases
-```
-
-This is the right document strategy for your CMAPSS-based predictive-maintenance RAG recommendation system.
+With that, I can generate the real `similar_case_rag` cases that your recommendation system will retrieve.
